@@ -19,7 +19,7 @@
 #include <time.h>
 
 
-//#define SIZE_BUF	1024 //Tamanho do buffer
+
 #define MAX_BUF 1024
 #define MAX_DOMAINS 5
 
@@ -30,12 +30,13 @@ void sendReply(unsigned short, unsigned char*, int, int, struct sockaddr_in);
  
 
 void set_hora(int* hora);
-void cria_pool(int num_workers, int tam_max);
+void cria_pool(int num_workers);
 void* func_thread_pool(void* id_thread);
 int destroi_pool();
 void gestao_config();
 void *imprime_estatisticas();
 void gestao_estatisticas();
+
 
 //DNS header structure
 struct DNS_HEADER
@@ -112,10 +113,11 @@ typedef struct {
 
 // Estrutura dos pedidos
 typedef struct pedido {
-	int tipo_pedido; // 1: estático, 2: dinâmico 
+	int tipo_dominio; // 1: prioritario, 2: secundario 
 	int socket;
 	char buffer[1024];
-	//char buffer[SIZE_BUF];
+	int query_id;
+	struct sockaddr_in dest;
 	struct pedido* next;
 } request;
 
@@ -123,18 +125,20 @@ typedef struct pedido {
 typedef struct pool* threadpool;
 typedef struct pool {
 	int num_threads; //Número de threads na pool
-	int max_requests; //Número máximo de pedidos
 
 	pthread_t* threads;
 	int* ids;
 	
+	int num_requests_prio; //Número de pedidos na fila de espera de pedidos
+	request* head_prio;
+	//request* tail_prio;
+
 	int num_requests; //Número de pedidos na fila de espera de pedidos
 	request* head;
-	request* tail;
+	//request* tail;
 
 	pthread_mutex_t lock;
 	pthread_cond_t not_empty;
-	pthread_cond_t not_full;
 	pthread_cond_t empty;
 
 	// Flags utilizadas na destruição da pool de threads
@@ -146,15 +150,14 @@ typedef struct pool {
 mem_config* configuracoes; //Memória partilhada das configurações
 sem_t* mem; // Semáforo para controlar acesso à memória partilhada das configurações
 
-//mem_estatisticas* estatisticas; //Memória partilhada das estatísticas
-//sem_t* esta;  //Semáforo para controlar acesso à memória partilhada das estatísticas
-
+void send_local(request* pedido);
 int port, socket_conn, new_conn, size;
 int shmid, shesta, mqid;
 int hora_arranque[3], hora_actual[6]; 
 pid_t processos[2]; 
 threadpool pool_main; // Apenas irá ser criada uma pool de threads
 estatistica msg;
+char * src;
 
 //Vai buscar a hora, os minutos e os segundos actuais
 void set_hora(int* hora){
@@ -309,11 +312,9 @@ void read_config_file(){
 }
 
 
-/*
 //Cria a pool de threads
-void cria_pool(int num_workers, int tam_max){
+void cria_pool(int num_workers){
 	int i;
-
 	// Se ocorrer um erro na alocação de memória, imprime uma mensagem de erro e sai
 	if((pool_main = (threadpool) malloc(sizeof(poolthreads))) == NULL){
 		printf("ERRO na alocação de memória\n");
@@ -322,7 +323,6 @@ void cria_pool(int num_workers, int tam_max){
 
 	// Inicialização
 	pool_main->num_threads = num_workers;
-	pool_main->max_requests = tam_max;
 
 	// Se ocorrer um erro na alocação de memória, imprime uma mensagem de erro e sai
 	if((pool_main->threads = (pthread_t*) malloc(num_workers * sizeof(pthread_t))) == NULL){
@@ -337,15 +337,17 @@ void cria_pool(int num_workers, int tam_max){
 	}
 
 	//Inicialização
+	pool_main->num_requests_prio = 0;
+	pool_main->head_prio = NULL;
+
 	pool_main->num_requests = 0;
 	pool_main->head = NULL;
-	pool_main->tail = NULL;
+	
 	pool_main->flag_fechada = 0;
 	pool_main->flag_shutdown = 0;
 
 	pthread_mutex_init(&(pool_main->lock), NULL);
 	pthread_cond_init(&(pool_main->not_empty), NULL);
-	pthread_cond_init(&(pool_main->not_full), NULL);
 	pthread_cond_init(&(pool_main->empty), NULL);
 
 	// Criação das threads da pool
@@ -359,58 +361,61 @@ void cria_pool(int num_workers, int tam_max){
 /* Função de cada uma das threads da pool
  * Verifica se existem pedidos na fila de espera
  * e responde de forma adequada conforme haja ou não pedidos disponíveis */
-/*void* func_thread_pool(void* id_thread){
+void* func_thread_pool(void* id_thread){
 	request* novo_pedido;
 	int id = *((int*) id_thread);
-	
-	estatistica msg;
 
 	while(1){
 		pthread_mutex_lock(&(pool_main->lock));
 
-		while(pool_main->num_requests == 0 && (!pool_main->flag_shutdown)) // Não existem pedidos na fila de espera e a pool não vai ser destruída
+		while(pool_main->num_requests_prio == 0 && pool_main->num_requests == 0 && (!pool_main->flag_shutdown)){ // Não existem pedidos na fila de espera e a pool não vai ser destruída
 			pthread_cond_wait(&(pool_main->not_empty), &(pool_main->lock)); // Aguarda por pedidos
-
+		}
 		if(pool_main->flag_shutdown){ //A pool vai ser destruída
 			pthread_mutex_unlock(&(pool_main->lock));
 			pthread_exit(NULL); //Termina a thread
 		}
-
-		//set_hora(msg.hora_recepcao);
-		//msg.thread = id;
+		// Vai buscar o próximo pedido da fila de espera dos pedidos prioritarios 
+		if (pool_main->num_requests_prio != 0){		
+			novo_pedido = pool_main->head_prio;
 		
-		// Vai buscar o próximo pedido da fila de espera
-		novo_pedido = pool_main->head;
-		msg.mtype = (long) novo_pedido->tipo_pedido;
-		strcpy(msg.pag_script, novo_pedido->buffer);
-		
-		pool_main->num_requests--;
-		if(pool_main->num_requests == 0){
-			pool_main->head = NULL;
-			pool_main->tail = NULL;
+			pool_main->num_requests_prio--;
+			if(pool_main->num_requests_prio == 0){
+				pool_main->head_prio = NULL;
+			}
+			else
+				pool_main->head_prio = novo_pedido->next;
+			if(pool_main->num_requests_prio == 0) //A fila de espera ficou sem pedidos
+				pthread_cond_signal(&(pool_main->empty)); //Sinaliza a variável de condição empty
 		}
-		else
-			pool_main->head = novo_pedido->next;
-		if(pool_main->num_requests == 0) //A fila de espera ficou sem pedidos
-			pthread_cond_signal(&(pool_main->empty)); //Sinaliza a variável de condição empty
+		// Vai buscar o próximo pedido da fila de espera dos pedidos secundarios
+		else{
+			novo_pedido = pool_main->head;
+		
+			pool_main->num_requests--;
+			if(pool_main->num_requests == 0){
+				pool_main->head = NULL;
+				//pool_main->tail = NULL;
+			}
+			else
+				pool_main->head = novo_pedido->next;
+			if(pool_main->num_requests == 0) //A fila de espera ficou sem pedidos
+				pthread_cond_signal(&(pool_main->empty)); //Sinaliza a variável de condição empty
+		}
 
 		pthread_mutex_unlock(&(pool_main->lock));
 		
 		#if DEBUG
 		printf("\nfunc_thread_pool: a analisar pedido recebido %s\n", novo_pedido->buffer);
 		#endif
-
 		// Atende o próximo pedido
-		if(novo_pedido->tipo_pedido == 2)
-			// Verifica se é possível executar o script e em caso afirmativo envio o resultado ao cliente
-			//execute_script(novo_pedido->socket, novo_pedido->buffer);
+		if(novo_pedido->tipo_dominio == 1)
+			send_local(novo_pedido);
+	
 
-		//else if(novo_pedido->tipo_pedido == 1)
-			// Procura o ficheiro com a página html e envia para o cliente
-			//send_page(novo_pedido->socket, novo_pedido->buffer);
+		//else if(novo_pedido->tipo_dominio == 2)
+			
 
-		//set_hora(msg.hora_fim);
-		msgsnd(mqid, &msg, sizeof(estatistica)-sizeof(long), 0); // Envia uma mensagem para a fila de mensagens
 		free(novo_pedido);
 		sleep(5);
 	}
@@ -418,10 +423,62 @@ void cria_pool(int num_workers, int tam_max){
 	pthread_exit(NULL);
 }
 
+// Adiciona novo pedido à fila de espera
+int adiciona_pedido(int tipo_dominio, int socket, char* buffer, int query_id, struct sockaddr_in dest){
+	request *novo_pedido, *aux;
 
-/*
+	// Garante exclusão mútua -> bloqueia o mutex
+	pthread_mutex_lock(&(pool_main->lock));
+	
+	// A pool de threads vai ser destruída
+	if(pool_main->flag_shutdown || pool_main->flag_fechada){
+		pthread_mutex_unlock(&(pool_main->lock));
+		return -1;
+	}
+
+	// Aloca memória para o novo pedido
+	novo_pedido = (request*) malloc(sizeof(request));
+	novo_pedido->tipo_dominio = tipo_dominio;
+	novo_pedido->socket = socket;
+	strcpy(novo_pedido->buffer, buffer);
+	novo_pedido->query_id = query_id;
+	novo_pedido->dest = dest;
+	novo_pedido->next = NULL;
+
+	if (tipo_dominio == 1){
+		if(pool_main->num_requests_prio == 0){
+			pool_main->head_prio = novo_pedido;
+		}
+		else{
+			aux = pool_main->head_prio;
+			while(aux->next != NULL)
+				aux = aux->next;
+			aux->next = novo_pedido;
+		}
+		pool_main->num_requests_prio++;
+
+	}
+	else{
+		if(pool_main->num_requests == 0){
+			pool_main->head = novo_pedido;
+		}
+		else{
+			aux = pool_main->head_prio;
+			while(aux->next != NULL)
+				aux = aux->next;
+			aux->next = novo_pedido;
+		}
+		pool_main->num_requests++;
+	}
+	pthread_cond_broadcast(&(pool_main->not_empty)); // sinaliza todas as threads bloquadas na variável de condição not_empty --> a fila de espera prioritária já tem pedidos
+	pthread_mutex_unlock(&(pool_main->lock)); // Desbloqueia o mutex
+	return 0;
+}
+
+
 /* Destrói a pool antes de terminar --> a flag flag_shutdown é activada
- // e as threads da pool terminam a sua execução 
+ * e as threads da pool terminam a sua execução 
+*/
 int destroi_pool(){
 	int i;
 	request* aux;
@@ -439,7 +496,6 @@ int destroi_pool(){
 
 	// "Acorda" todas as threads para que possam verificar a flag flag_shutdown
 	pthread_cond_broadcast(&(pool_main->not_empty));
-	pthread_cond_broadcast(&(pool_main->not_full));
 
 	// Espera por todas as threads da pool
 	for(i=0; i<pool_main->num_threads; i++)
@@ -448,6 +504,11 @@ int destroi_pool(){
 	// Liberta os recursos
 	free(pool_main->threads);
 	free(pool_main->ids);
+	while(pool_main->head_prio!=NULL){
+		aux = pool_main->head_prio->next;
+		pool_main->head_prio = pool_main->head_prio->next;
+		free(aux);
+	}
 	while(pool_main->head!=NULL){
 		aux = pool_main->head->next;
 		pool_main->head = pool_main->head->next;
@@ -455,12 +516,13 @@ int destroi_pool(){
 	}
 	free(pool_main);
 	return 0;
-} */
+} 
 
 
 // Imprime as estatísticas 
 void *imprime_estatisticas(){
 	while(1){
+		sleep(30);
 		printf("\n\n********* ESTATÍSTICAS *********\n");
 		printf("Hora arranque: %.2d:%.2d:%.2d\n", hora_arranque[0], hora_arranque[1], hora_arranque[2]); //Imprime a hora de arranque da execução
 		printf("Número total de pedidos: %d\n", msg.num_total_pedidos_processados);
@@ -468,7 +530,6 @@ void *imprime_estatisticas(){
 		printf("Número de endereços do domínio local resolvidos: %d\n", msg.num_enderecos_local);
 		printf("Número de endereços do domínios externos resolvidos: %d\n", msg.num_enderecos_externo);
 		printf("Última informação: %d-%d-%d   %.2d:%.2d:%.2d\n", hora_actual[3], hora_actual[4], hora_actual[5], hora_actual[0], hora_actual[1], hora_actual[2]); //Imprime a hora actual/final
-		sleep(30);
 	}
 }
 
@@ -485,7 +546,7 @@ void gestao_estatisticas(){
 	pthread_t tid;
 	pthread_create(&tid, NULL, &imprime_estatisticas, NULL);
 	//printf("PID: %d\n", getpid());
-	//signal(SIGHUP, sighup); // Tratamento do sinal SIGHUP
+	
 	fd = open(configuracoes->named_pipe_estat, O_RDONLY);
 
 
@@ -520,29 +581,61 @@ void gestao_config(){
 	exit(0);
 }
 
-int get_stat(int fdin)
-{
+int get_stat(int fdin){
+	
 	struct stat pstatbuf;	
-	if (fstat(fdin, &pstatbuf) < 0)	/* need size of input file */
-	{
+	if (fstat(fdin, &pstatbuf) < 0){	/* need size of input file */
 		fprintf(stderr,"fstat error\n");
 		exit(1);
 	}
 	return pstatbuf.st_size;
 }
 
+//Enviar a resposta quando se trata de um pedido local
+void send_local(request* pedido){
+	printf("ENVIAR RESPOSTA LOCAL\n");
+	char localdomains[MAX_BUF], local_ip[MAX_BUF];
+	int i,k,j;
 
-int main( int argc , char *argv[])
-{
+	for(i = 0; i < strlen(src); i++){
+		k = 0;
+		while(src[i] != ' '){
+			localdomains[k] = src[i];
+			i++;
+			k++;
+		}
+		localdomains[k] = '\0';
+		if (strcmp(localdomains, pedido->buffer) == 0){
+			j = 0;
+			while ((src[i] != '\n')){
+				if (src[i] != ' '){
+					local_ip[j] = src[i];
+					j++;
+				}
+				i++;
+			}
+			sendReply(pedido->query_id, pedido->buffer, inet_addr(local_ip), pedido->socket, pedido->dest); //Envia a resposta caso pertença ao localdns.txt!
+			break;
+		}
+		else{
+			while (src[i] != '\n')
+				i++;
+		} 
+	}
+}
+
+
+
+int main( int argc , char *argv[]){
+
 	set_hora(hora_arranque); // Determina a hora de arranque do Servidor
 	struct sockaddr_in client_name;
 	socklen_t client_name_len = sizeof(client_name);
-	int i, fd, fdin;
-	char * src, *ptr;
+	int i, fd, fdin, j, k;
+	char *ptr;
 	char req_buf[1024];
-	char buffer[MAX_BUF];
-	//char req_buf[1024], buf[1024];
-	//char req_buf[SIZE_BUF], buf[SIZE_BUF];
+	char buffer[MAX_BUF], line[MAX_BUF];
+
 
 	// Verifica o número de argumentos
 	if(argc!=2) {
@@ -572,16 +665,10 @@ int main( int argc , char *argv[])
 		exit(1);
 	}
 
-	// Cria a fila de mensagens
-	mqid = msgget(IPC_PRIVATE, IPC_CREAT|0700);
-	if(mqid < 0){
-		perror("ERRO ao criar message queue");
-		exit(1);
-	}
-
+	//Mapeiar o ficheiro localdns.txt para memória (Memory mapped files)
 	if ( (fdin = open("localdns.txt", O_RDONLY)) < 0)
 	{
-		fprintf(stderr,"can't open %s for reading\n", argv[2]);
+		fprintf(stderr,"Can't open localdns.txt for reading");
 		exit(1);
 	}
 
@@ -593,11 +680,7 @@ int main( int argc , char *argv[])
 		fprintf(stderr,"mmap error for input\n");
 		exit(1);
 	}
-	for (i = 0; i < strlen(src); i++){
-		if(src[i] == '\n')
-			printf("aqui\n");
-	}
-	printf("MMAP %s\n", src);
+	
 	// Cria os processos filho
 	for(i=0; i<2; i++){
 		if((processos[i] = fork()) == 0){
@@ -614,6 +697,7 @@ int main( int argc , char *argv[])
 		}
 	}
 	sleep(3);
+	cria_pool(configuracoes->num_threads);
 	/* create the FIFO (named pipe) */
     mkfifo(configuracoes->named_pipe_estat, 0666);
     /* write "Hi" to the FIFO */
@@ -685,16 +769,14 @@ int main( int argc , char *argv[])
 	while(1) {
 		// Receive questions
 		len = sizeof(dest);
-		printf("\n\n-- Wating for DNS message --\n\n");
+		printf("\n\n-- Waiting for DNS message --\n\n");
 		if(recvfrom (sockfd,(char*)buf , 65536 , 0 , (struct sockaddr*)&dest , &len) < 0) {
 			printf("Error while waiting for DNS message. Exiting...\n");
 			exit(1);
 		}
 		
 		printf("DNS message received\n");
-		//bufa = "recusa";
-	 	sprintf(buffer,"recusa");
-	 	write(fd, buffer, sizeof(buffer));
+		
 		// Process received message
 		dns = (struct DNS_HEADER*) buf;
 		//qname =(unsigned char*)&buf[sizeof(struct DNS_HEADER)];
@@ -741,12 +823,28 @@ int main( int argc , char *argv[])
 		printf(">> QUERY: %s\n", query.name);
 		printf(">> Type (A): %d\n", ntohs(query.ques->qtype));
 		printf(">> Class (IN): %d\n\n", ntohs(query.ques->qclass));
-			
+
+		//VERIFICAR SE É PARA RECUSAR PEDIDO OU NÃO
+
+		if (strstr(query.name, configuracoes->local_domain) != NULL){
+			sprintf(buffer,"local");
+	 		write(fd, buffer, sizeof(buffer));
+	 		adiciona_pedido(1, sockfd, query.name, dns->id, dest);
+			//adiciona pedido fila prioritaria
+		}
+		else{
+			sprintf(buffer,"externo");
+	 		write(fd, buffer, sizeof(buffer));
+	 		adiciona_pedido(2, sockfd, query.name, dns->id, dest);
+			//adiciona pedido a fila secundaria
+		}
+
 		// ****************************************
 		// Example reply to the received QUERY
 		// (Currently replying 10.0.0.2 to all QUERY names)
 		// ****************************************
-		sendReply(dns->id, query.name, inet_addr("10.0.0.2"), sockfd, dest);
+		//sendReply(dns->id, query.name, inet_addr("10.0.0.2"), sockfd, dest); //Caso não pertença ao localdns.txt....
+		
 	}
 	
 	//fechar o pipe
@@ -755,6 +853,7 @@ int main( int argc , char *argv[])
 	close(fdin);
     /* remove the FIFO */
     unlink(configuracoes->named_pipe_estat);
+    destroi_pool();
 
     return 0;
 }
