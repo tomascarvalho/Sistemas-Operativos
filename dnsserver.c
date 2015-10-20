@@ -413,8 +413,7 @@ void* func_thread_pool(void* id_thread){
 			send_local(novo_pedido);
 	
 
-		//else if(novo_pedido->tipo_dominio == 2)
-			
+		else if(novo_pedido->tipo_dominio == 2)
 
 		free(novo_pedido);
 		sleep(5);
