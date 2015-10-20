@@ -766,7 +766,7 @@ int main( int argc , char *argv[]){
 	// ****************************************
 	
 	while(1) {
-		// Receive questions
+		// Receive questions 
 		len = sizeof(dest);
 		printf("\n\n-- Waiting for DNS message --\n\n");
 		if(recvfrom (sockfd,(char*)buf , 65536 , 0 , (struct sockaddr*)&dest , &len) < 0) {
