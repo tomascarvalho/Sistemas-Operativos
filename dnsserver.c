@@ -94,7 +94,7 @@ struct QUERY
     struct QUESTION *ques;
 };
 
-// Estrutura da memória partilhada->Parâmetros de Configuração
+// Estrutura da memória partilhada - Parâmetros de Configuração
 typedef struct {
 	int num_threads; 
 	char domains[MAX_DOMAINS][MAX_BUF];
@@ -129,13 +129,11 @@ typedef struct pool {
 	pthread_t* threads;
 	int* ids;
 	
-	int num_requests_prio; //Número de pedidos na fila de espera de pedidos
+	int num_requests_prio; //Número de pedidos na fila de espera de pedidos prioritaria
 	request* head_prio;
-	//request* tail_prio;
 
-	int num_requests; //Número de pedidos na fila de espera de pedidos
+	int num_requests; //Número de pedidos na fila de espera de pedidos secundaria
 	request* head;
-	//request* tail;
 
 	pthread_mutex_t lock;
 	pthread_cond_t not_empty;
@@ -192,46 +190,39 @@ void read_config_file(){
 	fp = fopen("config.txt", "r");
 
 	conta = 0;
-	while(fgets(line, MAX_BUF, fp)!= NULL)
-	{
+	while(fgets(line, MAX_BUF, fp)!= NULL){
 		conta ++;
 		run_line = 0;
-		while (line[run_line] != '=')
-		{
+		while (line[run_line] != '='){
 			run_line ++;
 		}
 		run_line++;
 
-		if (line[run_line] == ' ')
-		{
+		if (line[run_line] == ' '){
 			run_line++;
 		}
 
 		what_we_want = 0;
-		while((line[run_line] != '\0') && (line[run_line] != '\n'))
-		{
+		while((line[run_line] != '\0') && (line[run_line] != '\n')){
 			temp_line[what_we_want] = line[run_line];
 			what_we_want++;
 			run_line++;
 		}
-
 		temp_line[what_we_want] = '\0';
 
-		switch(conta)
-		{
+		switch(conta){
 			case 1:
 				num_threads = atoi(temp_line);
 				configuracoes->num_threads = num_threads;
 				//printf("\nNUM THREADS: %d\n", num_threads);
 				break;
+			
 			case 2:
 				run_line= 0;
 				run_temp = 0;
 				domain_counter = 0;
-				while ((temp_line[run_line] != '\n') && (temp_line[run_line] != '\0'))
-				{
-					if (temp_line[run_line] ==  ';')
-					{
+				while ((temp_line[run_line] != '\n') && (temp_line[run_line] != '\0')){
+					if (temp_line[run_line] ==  ';'){
 						other_temp_line[run_temp] = '\0';
 						//puts(other_temp_line);
 						strcpy(configuracoes->domains[domain_counter], other_temp_line);
@@ -243,13 +234,11 @@ void read_config_file(){
 					else if (temp_line[run_line] == ' ')
 						run_line++;
 
-					else
-					{
+					else{
 						other_temp_line[run_temp] = temp_line[run_line];
 						run_temp++;
 						run_line++;
 					}
-
 				}
 				other_temp_line[run_temp] = '\0';
 				strcpy(configuracoes->domains[domain_counter], other_temp_line);
@@ -257,22 +246,16 @@ void read_config_file(){
 				break;
 
 			case 3:
-
 				run_line= 0;
 				run_temp = 0;
-				while ((temp_line[run_line] != '\n') && (temp_line[run_line] != '\0'))
-				{
-				
+				while ((temp_line[run_line] != '\n') && (temp_line[run_line] != '\0')){
 					if (temp_line[run_line] == ' ')
 						run_line++;
-
-					else
-					{
+					else{
 						other_temp_line[run_temp] = temp_line[run_line];
 						run_temp++;
 						run_line++;
 					}
-
 				}
 				other_temp_line[run_temp] = '\0';
 				//Pôr o other_temp_line na estrutura -. LOCAL DOMAIN
@@ -284,13 +267,10 @@ void read_config_file(){
 			case 4:
 				run_line= 0;
 				run_temp = 0;
-				while ((temp_line[run_line] != '\n') && (temp_line[run_line] != '\0'))
-				{
+				while ((temp_line[run_line] != '\n') && (temp_line[run_line] != '\0')){
 					if (temp_line[run_line] == ' ')
 						run_line++;
-
-					else
-					{
+					else{
 						other_temp_line[run_temp] = temp_line[run_line];
 						run_temp++;
 						run_line++;
@@ -299,7 +279,6 @@ void read_config_file(){
 				other_temp_line[run_temp] = '\0';
 				//Pôr o other_temp_line na estrutura -. NAMED PIPE STATISTICS
 				strcpy(configuracoes->named_pipe_estat, other_temp_line);
-				
 				//configuracoes->named_pipe_estat = other_temp_line;
 				//puts(other_temp_line);
 				break;
@@ -395,7 +374,6 @@ void* func_thread_pool(void* id_thread){
 			pool_main->num_requests--;
 			if(pool_main->num_requests == 0){
 				pool_main->head = NULL;
-				//pool_main->tail = NULL;
 			}
 			else
 				pool_main->head = novo_pedido->next;
@@ -405,15 +383,13 @@ void* func_thread_pool(void* id_thread){
 
 		pthread_mutex_unlock(&(pool_main->lock));
 		
-		#if DEBUG
-		printf("\nfunc_thread_pool: a analisar pedido recebido %s\n", novo_pedido->buffer);
-		#endif
-		// Atende o próximo pedido
+
+		// Atende o próximo pedido prioritário
 		if(novo_pedido->tipo_dominio == 1)
 			send_local(novo_pedido);
 	
-
-		else if(novo_pedido->tipo_dominio == 2)
+		// Atende o próximo pedido secundário
+		//else if(novo_pedido->tipo_dominio == 2)
 
 		free(novo_pedido);
 		sleep(5);
@@ -426,7 +402,7 @@ void* func_thread_pool(void* id_thread){
 int adiciona_pedido(int tipo_dominio, int socket, char* buffer, int query_id, struct sockaddr_in dest){
 	request *novo_pedido, *aux;
 
-	// Garante exclusão mútua -> bloqueia o mutex
+	// Garante exclusão mútua - bloqueia o mutex
 	pthread_mutex_lock(&(pool_main->lock));
 	
 	// A pool de threads vai ser destruída
@@ -444,6 +420,7 @@ int adiciona_pedido(int tipo_dominio, int socket, char* buffer, int query_id, st
 	novo_pedido->dest = dest;
 	novo_pedido->next = NULL;
 
+	//Adiciona pedido à fila de espera
 	if (tipo_dominio == 1){
 		if(pool_main->num_requests_prio == 0){
 			pool_main->head_prio = novo_pedido;
@@ -469,7 +446,7 @@ int adiciona_pedido(int tipo_dominio, int socket, char* buffer, int query_id, st
 		}
 		pool_main->num_requests++;
 	}
-	pthread_cond_broadcast(&(pool_main->not_empty)); // sinaliza todas as threads bloquadas na variável de condição not_empty --> a fila de espera prioritária já tem pedidos
+	pthread_cond_broadcast(&(pool_main->not_empty)); // sinaliza todas as threads bloquadas na variável de condição not_empty -- a fila de espera prioritária já tem pedidos
 	pthread_mutex_unlock(&(pool_main->lock)); // Desbloqueia o mutex
 	return 0;
 }
@@ -532,7 +509,7 @@ void *imprime_estatisticas(){
 	}
 }
 
-// Processo Filho -> Gestão de Estatísticas 
+// Processo Filho - Gestão de Estatísticas 
 void gestao_estatisticas(){
 	sleep(3);
 	msg.num_pedidos_recusados = 0;
@@ -544,7 +521,6 @@ void gestao_estatisticas(){
 	char buf[MAX_BUF];
 	pthread_t tid;
 	pthread_create(&tid, NULL, &imprime_estatisticas, NULL);
-	//printf("PID: %d\n", getpid());
 	
 	fd = open(configuracoes->named_pipe_estat, O_RDONLY);
 
@@ -572,7 +548,7 @@ void gestao_estatisticas(){
 
 	exit(0);
 }
-// Processo Filho -> Gestão da configurações
+// Processo Filho - Gestão da configurações
 void gestao_config(){
 	printf("READING CONFIGURATION FILE...\n");
     read_config_file();
@@ -580,8 +556,8 @@ void gestao_config(){
 	exit(0);
 }
 
+// Vê o tamanho do ficheiro a ser mapeado para a memória
 int get_stat(int fdin){
-	
 	struct stat pstatbuf;	
 	if (fstat(fdin, &pstatbuf) < 0){	/* need size of input file */
 		fprintf(stderr,"fstat error\n");
@@ -590,7 +566,7 @@ int get_stat(int fdin){
 	return pstatbuf.st_size;
 }
 
-//Enviar a resposta quando se trata de um pedido local
+// Enviar a resposta quando se trata de um pedido local
 void send_local(request* pedido){
 	printf("ENVIAR RESPOSTA LOCAL\n");
 	char localdomains[MAX_BUF], local_ip[MAX_BUF];
@@ -670,10 +646,8 @@ int main( int argc , char *argv[]){
 		fprintf(stderr,"Can't open localdns.txt for reading");
 		exit(1);
 	}
-
 	size = get_stat(fdin);
 
-/* Zona # 1*/
 	if ( (src = mmap(0, size, PROT_READ, MAP_FILE | MAP_PRIVATE, fdin, 0)) == (caddr_t) -1)
 	{
 		fprintf(stderr,"mmap error for input\n");
@@ -697,11 +671,10 @@ int main( int argc , char *argv[]){
 	}
 	sleep(3);
 	cria_pool(configuracoes->num_threads);
-	/* create the FIFO (named pipe) */
+	
+	// Criar um named pipe
     mkfifo(configuracoes->named_pipe_estat, 0666);
-    /* write "Hi" to the FIFO */
     fd = open(configuracoes->named_pipe_estat, O_WRONLY);
-    //write(fd,, sizeof("Hi"));
 
 
 	//*******************************
@@ -766,7 +739,7 @@ int main( int argc , char *argv[]){
 	// ****************************************
 	
 	while(1) {
-		// Receive questions 
+		// Receive questions
 		len = sizeof(dest);
 		printf("\n\n-- Waiting for DNS message --\n\n");
 		if(recvfrom (sockfd,(char*)buf , 65536 , 0 , (struct sockaddr*)&dest , &len) < 0) {
