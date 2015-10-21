@@ -242,6 +242,7 @@ void read_config_file(){
 				}
 				other_temp_line[run_temp] = '\0';
 				strcpy(configuracoes->domains[domain_counter], other_temp_line);
+				strcpy(configuracoes->domains[domain_counter+1], "\0");
 				//puts(other_temp_line);
 				break;
 
@@ -606,7 +607,7 @@ int main( int argc , char *argv[]){
 	set_hora(hora_arranque); // Determina a hora de arranque do Servidor
 	struct sockaddr_in client_name;
 	socklen_t client_name_len = sizeof(client_name);
-	int i, fd, fdin, j, k;
+	int i, fd, fdin, j, k, recusa = 0;
 	char *ptr;
 	char req_buf[1024];
 	char buffer[MAX_BUF], line[MAX_BUF];
@@ -797,20 +798,41 @@ int main( int argc , char *argv[]){
 		printf(">> Class (IN): %d\n\n", ntohs(query.ques->qclass));
 
 		//VERIFICAR SE É PARA RECUSAR PEDIDO OU NÃO
-
+		recusa = 0;
 		if (strstr(query.name, configuracoes->local_domain) != NULL){
+			printf("\nE LOCAL!\n");
 			sprintf(buffer,"local");
 	 		write(fd, buffer, sizeof(buffer));
 	 		adiciona_pedido(1, sockfd, query.name, dns->id, dest);
+	 		recusa = 1;
 			//adiciona pedido fila prioritaria
 		}
-		else{
-			sprintf(buffer,"externo");
-	 		write(fd, buffer, sizeof(buffer));
-	 		adiciona_pedido(2, sockfd, query.name, dns->id, dest);
-			//adiciona pedido a fila secundaria
-		}
+		
+		else {
+			i = 0;
+			while (configuracoes->domains[i]!= '\0') {
 
+				if(strstr(query.name, configuracoes->domains[i]) != NULL) {
+					recusa = 1;
+					sprintf(buffer,"externo");
+					printf("\nE EXTERNO!\n");
+			 		write(fd, buffer, sizeof(buffer));
+			 		adiciona_pedido(2, sockfd, query.name, dns->id, dest);
+			 		break;
+			 		//adiciona pedido a fila secundaria
+				}
+				i++;
+			}
+
+		}
+		
+		
+		if (recusa == 0){
+			sprintf(buffer,"recusa");
+			printf("\nE PARA RECUSAR\n");
+			//recusa pedido
+			
+		}
 		// ****************************************
 		// Example reply to the received QUERY
 		// (Currently replying 10.0.0.2 to all QUERY names)
