@@ -1,2 +1,3 @@
-server: dnsserver.c 
-	gcc -o server dnsserver.c -lpthread
+server : dnsserver.c
+	gcc dnsserver.c -o server -lpthread
+	./server 53000

@@ -1,3 +1,14 @@
+/********************************************************************************
+*						Sistemas Operativos 2015/2016							*
+*								Servidor DNS 									*
+*																				*
+*				Rita Maria Faria de Almeida			2012169259					*
+*			Tomás Morgado de Carvalho Conceição		2012138578					*
+*																				*
+* Tempo total: ~50h 																*
+*********************************************************************************/
+
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -17,26 +28,31 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <stdbool.h>
 
+
+//processos - ps aux | grep server
+//kill -SIGUSR1 num_processo
 
 
 #define MAX_BUF 1024
 #define MAX_DOMAINS 5
 
+//DEBUG - Comentar para desactivar o DEBUG
+//#define DEBUG
+//DEBUG - Tirar o comentário para activar o DEBUG
+
  
 void convertName2RFC (unsigned char*,unsigned char*);
 unsigned char* convertRFC2Name (unsigned char*,unsigned char*,int*);
-void sendReply(unsigned short, unsigned char*, int, int, struct sockaddr_in);
- 
+void sendReply(unsigned short, unsigned char*, int, int, struct sockaddr_in, int);
 
-void set_hora(int* hora);
-void cria_pool(int num_workers);
+
 void* func_thread_pool(void* id_thread);
 int destroi_pool();
-void gestao_config();
-void *imprime_estatisticas();
-void gestao_estatisticas();
-
+int get_stat(int fdin);
 
 //DNS header structure
 struct DNS_HEADER
@@ -100,6 +116,8 @@ typedef struct {
 	char domains[MAX_DOMAINS][MAX_BUF];
 	char local_domain[MAX_BUF];
 	char named_pipe_estat[MAX_BUF];
+	int num_domain_extern;
+	bool manutencao;
 } mem_config;
 
 
@@ -114,11 +132,11 @@ typedef struct {
 // Estrutura dos pedidos
 typedef struct pedido {
 	int tipo_dominio; // 1: prioritario, 2: secundario 
-	int socket;
-	char buffer[1024];
-	int query_id;
+	int socket; // 
+	char buffer[MAX_BUF]; // String com o pedido
+	int query_id; // ID da query
 	struct sockaddr_in dest;
-	struct pedido* next;
+	struct pedido* next; // Ponteiro para o próximo pedido
 } request;
 
 // Estrutura da pool de threads
@@ -147,15 +165,26 @@ typedef struct pool {
 
 mem_config* configuracoes; //Memória partilhada das configurações
 sem_t* mem; // Semáforo para controlar acesso à memória partilhada das configurações
+sem_t* mmf; // Semáforo para controlar acesso ao memory mapped file
 
-void send_local(request* pedido);
-int port, socket_conn, new_conn, size;
-int shmid, shesta, mqid;
+
+int port, sockfd, size, fd, fdin, fd_estatisticas_read, config_pid;
+int shmid;
 int hora_arranque[3], hora_actual[6]; 
 pid_t processos[2]; 
+
+
 threadpool pool_main; // Apenas irá ser criada uma pool de threads
+
 estatistica msg;
-char * src;
+
+char * local_domain_mmf; //Mapeia o ficheiro para memoria
+
+void send_extern(request* pedido);
+void send_local(request* pedido);
+
+pthread_t thread_estatisticas;
+
 
 //Vai buscar a hora, os minutos e os segundos actuais
 void set_hora(int* hora){
@@ -169,6 +198,10 @@ void set_hora(int* hora){
 }
 
 void set_hora_data(int* hora){
+	#ifdef DEBUG
+	printf("DEBUG: A definir hora e data\n");
+	#endif
+
 	struct tm* nova_hora;
 	time_t hour;
 	time(&hour);
@@ -181,6 +214,7 @@ void set_hora_data(int* hora){
 	hora[5] = nova_hora->tm_year+1900;
 }
 
+//Lê o fichiro config.txt 
 void read_config_file(){
 	char line[MAX_BUF];
 	char temp_line[MAX_BUF], other_temp_line[MAX_BUF];
@@ -189,7 +223,12 @@ void read_config_file(){
 	FILE *fp;
 	fp = fopen("config.txt", "r");
 
+	#ifdef DEBUG
+	printf("DEBUG: A ler ficheiro de configuracoes: config.txt...\n");
+	#endif
+
 	conta = 0;
+	configuracoes->manutencao = false;
 	while(fgets(line, MAX_BUF, fp)!= NULL){
 		conta ++;
 		run_line = 0;
@@ -214,7 +253,9 @@ void read_config_file(){
 			case 1:
 				num_threads = atoi(temp_line);
 				configuracoes->num_threads = num_threads;
-				//printf("\nNUM THREADS: %d\n", num_threads);
+				#ifdef DEBUG
+				printf("DEBUG: Numero de threads: %d\n", num_threads);
+				#endif
 				break;
 			
 			case 2:
@@ -222,28 +263,42 @@ void read_config_file(){
 				run_temp = 0;
 				domain_counter = 0;
 				while ((temp_line[run_line] != '\n') && (temp_line[run_line] != '\0')){
+					
 					if (temp_line[run_line] ==  ';'){
 						other_temp_line[run_temp] = '\0';
-						//puts(other_temp_line);
 						strcpy(configuracoes->domains[domain_counter], other_temp_line);
+						#ifdef DEBUG
+						printf("DEBUG: Dominio lido: ");
+						puts(other_temp_line);
+						#endif
 						run_line++;
 						bzero(other_temp_line, sizeof(other_temp_line));
 						run_temp = 0;
 						domain_counter++;
 					}
+
 					else if (temp_line[run_line] == ' ')
 						run_line++;
 
+					
 					else{
 						other_temp_line[run_temp] = temp_line[run_line];
 						run_temp++;
 						run_line++;
 					}
 				}
+				
 				other_temp_line[run_temp] = '\0';
 				strcpy(configuracoes->domains[domain_counter], other_temp_line);
-				strcpy(configuracoes->domains[domain_counter+1], "\0");
-				//puts(other_temp_line);
+				#ifdef DEBUG
+				printf("DEBUG: Dominio lido: ");
+				puts(other_temp_line);
+				#endif
+				domain_counter++;
+				configuracoes->num_domain_extern = domain_counter;
+				#ifdef DEBUG
+				printf("DEBUG: Numero de dominios lidos: %d\n", domain_counter);
+				#endif
 				break;
 
 			case 3:
@@ -259,18 +314,21 @@ void read_config_file(){
 					}
 				}
 				other_temp_line[run_temp] = '\0';
-				//Pôr o other_temp_line na estrutura -. LOCAL DOMAIN
 				strcpy(configuracoes->local_domain, other_temp_line);
-				//configuracoes->local_domain = other_temp_line;
-				//puts(other_temp_line);
+				#ifdef DEBUG
+				printf("DEBUG: Dominio local lido: ");
+				puts(other_temp_line);
+				#endif
 				break;
 
 			case 4:
 				run_line= 0;
 				run_temp = 0;
 				while ((temp_line[run_line] != '\n') && (temp_line[run_line] != '\0')){
+					
 					if (temp_line[run_line] == ' ')
 						run_line++;
+					
 					else{
 						other_temp_line[run_temp] = temp_line[run_line];
 						run_temp++;
@@ -278,10 +336,11 @@ void read_config_file(){
 					}
 				}
 				other_temp_line[run_temp] = '\0';
-				//Pôr o other_temp_line na estrutura -. NAMED PIPE STATISTICS
 				strcpy(configuracoes->named_pipe_estat, other_temp_line);
-				//configuracoes->named_pipe_estat = other_temp_line;
-				//puts(other_temp_line);
+				#ifdef DEBUG
+				printf("DEBUG: Named pipe estatistics: ");
+				puts(other_temp_line);
+				#endif
 				break;
 
 			default:
@@ -291,52 +350,122 @@ void read_config_file(){
 	fclose(fp);
 }
 
+// Resposta ao sinal SIGINT --> Thread das estatisticas
+void ctrl_c_esta(int sig){
+	#ifdef DEBUG
+	printf("DEBUG: Funcao ctrl_c chamada\n");
+	#endif
+	signal(SIGINT, ctrl_c_esta);
+	if (pthread_cancel(thread_estatisticas) == 0)
+		#ifdef DEBUG
+		printf("DEBUG: Thread estatisticas destruída...\n");
+		#endif
+	exit(0);
+}
 
-//Cria a pool de threads
-void cria_pool(int num_workers){
+// Resposta ao sinal SIGINT --> Libertação de recursos e limpeza ao terminar a aplicação
+void ctrl_c(int sig){
+	#ifdef DEBUG
+	printf("\nDEBUG: Libertação de recursos e limpeza após ctlr c... \n");
+	#endif
+
+	signal(SIGINT, ctrl_c); // Garante que está à espera do SIGINT
+	destroi_pool(); // Destói a pool de threads
+    kill(processos[1], SIGKILL); // 
+
+	// Fechar o pipe de escrita das estatísticas
+	close(fd);
+	// Desmapeia a memória mapeada
+	munmap(local_domain_mmf, get_stat(fdin));
+	// Fecha o ficheiro "localdns"
+	close(fdin);
+   
+    // Liberta o named pipe
+    unlink(configuracoes->named_pipe_estat);
+    // Fecha o pipe de leitura das estatísticas
+    close(fd_estatisticas_read);
+
+    shmdt(configuracoes); // Desmapeia a memória partilhada das configurações 
+    shmctl(shmid, IPC_RMID, NULL); // Destrói o segmento de memória partilhada 
+  	sem_close(mem); // Fecha o semáforo das configurações
+  	sem_close(mmf); // Fecha o semáforo do memory mapped file que contém os IPs locais
+
+  	printf("\nServer terminating\n");
+	close(sockfd); //Fecha o socket
+	exit(0);
+}
+
+
+//Funçao com boolean para saber se esta em modo de manutenção e se estiver volta a ler o ficheiro de configurações
+void modo_manutencao(int sig){
+	if (configuracoes->manutencao == true){
+		configuracoes->manutencao =false;
+		sem_wait(mem); 
+		read_config_file(); // Lê o ficheiro de configurações
+		sem_post(mem);
+		#ifdef DEBUG
+		printf("DEBUG: Sai da manutencao e li ficheiro!!!\n");
+		#endif
+	}
+	else{
+		configuracoes->manutencao = true;
+		#ifdef DEBUG
+		printf("DEBUG: Entrei na manutencao!!!\n");
+		#endif
+	}
+}
+
+//Cria a pool de threads e inicializa as filas de espera
+void cria_pool(int num_workers){ 
 	int i;
 	// Se ocorrer um erro na alocação de memória, imprime uma mensagem de erro e sai
 	if((pool_main = (threadpool) malloc(sizeof(poolthreads))) == NULL){
 		printf("ERRO na alocação de memória\n");
-		exit(-1);
+		exit(1);
 	}
 
-	// Inicialização
+	// Inicialização com o número de threads lidas do ficheiro de configurações
 	pool_main->num_threads = num_workers;
 
-	// Se ocorrer um erro na alocação de memória, imprime uma mensagem de erro e sai
+	// Aloca o espaço de memória necessário para o número de threads que queremos
+	//Se ocorrer um erro na alocação de memória, imprime uma mensagem de erro e sai
 	if((pool_main->threads = (pthread_t*) malloc(num_workers * sizeof(pthread_t))) == NULL){
 		printf("ERRO na alocação de memória\n");
-		exit(-1);
+		exit(1);
 	}
 
+	// Alocamos o espaço necessário para guardarmos os id's das threads
 	// Se ocorrer um erro na alocação de memória, imprime uma mensagem de erro e sai
 	if((pool_main->ids = (int*) malloc(num_workers * sizeof(int))) == NULL){
 		printf("ERRO na alocação de memória\n");
-		exit(-1);
+		exit(1);
 	}
 
-	//Inicialização
-	pool_main->num_requests_prio = 0;
-	pool_main->head_prio = NULL;
+	//Inicialização das filas de espera
+	pool_main->num_requests_prio = 0; // Número de pedidos prioritários por tratar
+	pool_main->head_prio = NULL; // Fila dos prioritários
 
-	pool_main->num_requests = 0;
-	pool_main->head = NULL;
+	pool_main->num_requests = 0; // Número de pedidos normais por tratar
+	pool_main->head = NULL; // Fila de pedidos normais
 	
-	pool_main->flag_fechada = 0;
-	pool_main->flag_shutdown = 0;
+	pool_main->flag_fechada = 0; // Flag que permite ou não a recepção de mais pedidos
+	pool_main->flag_shutdown = 0; // Indica que o sistema vai fechar
 
-	pthread_mutex_init(&(pool_main->lock), NULL);
-	pthread_cond_init(&(pool_main->not_empty), NULL);
-	pthread_cond_init(&(pool_main->empty), NULL);
+	pthread_mutex_init(&(pool_main->lock), NULL); // Inicializa o mutex 
+	pthread_cond_init(&(pool_main->not_empty), NULL); // Inicializa a variável de condição not_empty
+	pthread_cond_init(&(pool_main->empty), NULL); // Inicializa a variável de condição empty
 
 	// Criação das threads da pool
 	for(i=0; i<num_workers; i++){
+		#ifdef DEBUG
+		printf("DEBUG: A criar a thread: %d\n",i);
+		#endif 
+
+		// Cria as threads e guarda os seus ID's
 		pool_main->ids[i] = i;
 		pthread_create(&(pool_main->threads[i]), NULL, func_thread_pool, &(pool_main->ids[i]));
 	}
 }
-
 
 /* Função de cada uma das threads da pool
  * Verifica se existem pedidos na fila de espera
@@ -346,56 +475,73 @@ void* func_thread_pool(void* id_thread){
 	int id = *((int*) id_thread);
 
 	while(1){
+		// Exclusão mútua  enquanto as threads estão a ir buscar pedidos
 		pthread_mutex_lock(&(pool_main->lock));
 
 		while(pool_main->num_requests_prio == 0 && pool_main->num_requests == 0 && (!pool_main->flag_shutdown)){ // Não existem pedidos na fila de espera e a pool não vai ser destruída
+			#ifdef DEBUG
+			printf("DEBUG: Thread: %d --A aguardar por pedidos\n", id);
+			#endif
+			// Como não tem pedidos desbloqueia o mutex e fica à espera da variável not empty
 			pthread_cond_wait(&(pool_main->not_empty), &(pool_main->lock)); // Aguarda por pedidos
 		}
 		if(pool_main->flag_shutdown){ //A pool vai ser destruída
 			pthread_mutex_unlock(&(pool_main->lock));
+			#ifdef DEBUG
+			printf("DEBUG: A pool vai ser destruida Thread: %d --Vai ser destruida\n", id);
+			#endif
+			
 			pthread_exit(NULL); //Termina a thread
 		}
 		// Vai buscar o próximo pedido da fila de espera dos pedidos prioritarios 
-		if (pool_main->num_requests_prio != 0){		
+		if (pool_main->num_requests_prio != 0){
+
 			novo_pedido = pool_main->head_prio;
-		
 			pool_main->num_requests_prio--;
+		
 			if(pool_main->num_requests_prio == 0){
 				pool_main->head_prio = NULL;
 			}
+		
 			else
 				pool_main->head_prio = novo_pedido->next;
+		
 			if(pool_main->num_requests_prio == 0) //A fila de espera ficou sem pedidos
 				pthread_cond_signal(&(pool_main->empty)); //Sinaliza a variável de condição empty
 		}
 		// Vai buscar o próximo pedido da fila de espera dos pedidos secundarios
 		else{
 			novo_pedido = pool_main->head;
-		
 			pool_main->num_requests--;
+			
 			if(pool_main->num_requests == 0){
 				pool_main->head = NULL;
 			}
+			
 			else
 				pool_main->head = novo_pedido->next;
 			if(pool_main->num_requests == 0) //A fila de espera ficou sem pedidos
 				pthread_cond_signal(&(pool_main->empty)); //Sinaliza a variável de condição empty
 		}
-
 		pthread_mutex_unlock(&(pool_main->lock));
-		
 
+		#ifdef DEBUG
+		printf("A analisar pedido recebido: %s\n", novo_pedido->buffer);
+		#endif
+		
 		// Atende o próximo pedido prioritário
 		if(novo_pedido->tipo_dominio == 1)
 			send_local(novo_pedido);
-	
+		
 		// Atende o próximo pedido secundário
-		//else if(novo_pedido->tipo_dominio == 2)
+		else if(novo_pedido->tipo_dominio == 2)
+			send_extern(novo_pedido);
 
 		free(novo_pedido);
-		sleep(5);
+		//wait(NULL);
+		//podia não estar aqui mas assim pode evitar-se que as threads fiquem bloqueadas no while à espera de trabalho
+		sleep(3);
 	}
-
 	pthread_exit(NULL);
 }
 
@@ -422,6 +568,7 @@ int adiciona_pedido(int tipo_dominio, int socket, char* buffer, int query_id, st
 	novo_pedido->next = NULL;
 
 	//Adiciona pedido à fila de espera
+	//Pedidos prioritários
 	if (tipo_dominio == 1){
 		if(pool_main->num_requests_prio == 0){
 			pool_main->head_prio = novo_pedido;
@@ -433,8 +580,8 @@ int adiciona_pedido(int tipo_dominio, int socket, char* buffer, int query_id, st
 			aux->next = novo_pedido;
 		}
 		pool_main->num_requests_prio++;
-
 	}
+	//Pedidos secundários
 	else{
 		if(pool_main->num_requests == 0){
 			pool_main->head = novo_pedido;
@@ -452,54 +599,69 @@ int adiciona_pedido(int tipo_dominio, int socket, char* buffer, int query_id, st
 	return 0;
 }
 
-
 /* Destrói a pool antes de terminar --> a flag flag_shutdown é activada
- * e as threads da pool terminam a sua execução 
-*/
+ * e as threads da pool terminam a sua execução */
 int destroi_pool(){
+	#ifdef DEBUG
+	printf("DEBUG: Destruir pool...\n");
+	#endif
 	int i;
 	request* aux;
 
+	// Bloqueia o mutex
 	pthread_mutex_lock(&(pool_main->lock));
 
 	pool_main->flag_fechada = 1;
-
-	// Aguarda que os pedidos a ser atendidos de momento fiquem concluídos
-	while(pool_main->num_requests != 0)
+	//ERRO: Devia existir dois whiles para cada uma das filas, porque uma pode ficar vazia primeiro que a outro. Tambem deviam existir duas variaveis empty, uma para cada fila
+	// Aguarda que os pedidos a ser atendidos de momento fiquem concluídos. No código da entrega esquecemo-nos da condição para a fila dos prioritários
+	while(pool_main->num_requests != 0 && pool_main->num_requests_prio != 0)
+		//Ficam à espera do broadcast do empty e o mutex é libertado enquanto espera para as threads poderem trabalhar
 		pthread_cond_wait(&(pool_main->empty), &(pool_main->lock));
 
 	pool_main->flag_shutdown = 1;
 	pthread_mutex_unlock(&(pool_main->lock));
 
 	// "Acorda" todas as threads para que possam verificar a flag flag_shutdown
+	// Ao fazer broadcast do not_empty as threads vão ser desbloqueadas e avaliar a condição shutdown
 	pthread_cond_broadcast(&(pool_main->not_empty));
 
-	// Espera por todas as threads da pool
+	// Espera por todas as threads da pool que terminem
 	for(i=0; i<pool_main->num_threads; i++)
 		pthread_join(pool_main->threads[i], NULL);
 
 	// Liberta os recursos
+	#ifdef DEBUG
+	printf("DEBUG: A libertar recursos...\n");
+	#endif
 	free(pool_main->threads);
 	free(pool_main->ids);
+	
+	// Liberta a fila prioritária
 	while(pool_main->head_prio!=NULL){
 		aux = pool_main->head_prio->next;
 		pool_main->head_prio = pool_main->head_prio->next;
 		free(aux);
 	}
+	// Liberta a fila normal
 	while(pool_main->head!=NULL){
 		aux = pool_main->head->next;
 		pool_main->head = pool_main->head->next;
 		free(aux);
 	}
 	free(pool_main);
+
+	#ifdef DEBUG
+	printf("DEBUG: Pool destruida\n");
+	#endif
 	return 0;
 } 
 
 
 // Imprime as estatísticas 
 void *imprime_estatisticas(){
+	signal(SIGINT, ctrl_c_esta); // Quando recebe o sinal do tipo SIGINT (ctr_c) chama a função ctrl_c_esta
 	while(1){
-		sleep(30);
+		sleep(30); // Sleep(30) porque tem que imprimir as estatisticas a cada 30 segundos
 		printf("\n\n********* ESTATÍSTICAS *********\n");
 		printf("Hora arranque: %.2d:%.2d:%.2d\n", hora_arranque[0], hora_arranque[1], hora_arranque[2]); //Imprime a hora de arranque da execução
 		printf("Número total de pedidos: %d\n", msg.num_total_pedidos_processados);
@@ -512,24 +674,32 @@ void *imprime_estatisticas(){
 
 // Processo Filho - Gestão de Estatísticas 
 void gestao_estatisticas(){
-	sleep(3);
+	sleep(2); // Sleep(2) porque primeiro tem que ser criado o pipe para escrever
+	// Inicializa a estrutura das estatísticas a 0
 	msg.num_pedidos_recusados = 0;
 	msg.num_total_pedidos_processados = 0;
 	msg.num_enderecos_local = 0;
 	msg.num_enderecos_externo = 0;
 	FILE* fich;
-	int fd;
 	char buf[MAX_BUF];
-	pthread_t tid;
-	pthread_create(&tid, NULL, &imprime_estatisticas, NULL);
+	// Cria a thread para imprimir as estatísticas
+	pthread_create(&thread_estatisticas, NULL, &imprime_estatisticas, NULL); // thread_estatisticas -> Nome da thread
+																			 // NULL -> Não há atributos novos
+																			 // imprime_estatisticas -> Nome da função "gerida" pela thread
 	
-	fd = open(configuracoes->named_pipe_estat, O_RDONLY);
+	#ifdef DEBUG
+	printf("DEBUG: Criando pipe ler...\n");
+	#endif
 
+
+	// Abre o pipe das estatísticas para ler
+	fd_estatisticas_read = open(configuracoes->named_pipe_estat, O_RDONLY);
 
 	while(1){
-		read(fd, buf, MAX_BUF);
+		// Lê do pipe
+		read(fd_estatisticas_read, buf, MAX_BUF); // fd_estatisticas_read -> nome do pipe // buf -> buffer onde guardamos o que vem do pipe
 		set_hora_data(hora_actual);
-
+		//Incrementa o numero de pedidos respectivamente
 		if (strcmp(buf, "recusa") == 0){
 			msg.num_pedidos_recusados++;
 			msg.num_total_pedidos_processados++;
@@ -542,25 +712,27 @@ void gestao_estatisticas(){
 			msg.num_enderecos_externo++;
 			msg.num_total_pedidos_processados++;	
 		}
-		memset(&buf, 0, sizeof(buf));
-
+		memset(&buf, 0, sizeof(buf)); // Limpamos o buffer
 	}
-	close(fd);
-
 	exit(0);
 }
-// Processo Filho - Gestão da configurações
-void gestao_config(){
-	printf("READING CONFIGURATION FILE...\n");
-    read_config_file();
 
-	exit(0);
+
+// Processo Filho - Gestão da configurações executa primeiro que o das estatísticas
+void gestao_config(){
+	sem_wait(mem); // Se o semáforo está a 1 -> decrementa e continua . Caso esteja a 0 bloqueia
+    read_config_file(); // Lê o ficheiro de configurações para a memória partilhada
+    sem_post(mem); // Incrementa o semáforo
+    signal(SIGUSR1, modo_manutencao); // Caso receba um sinal do tipo SIGUSR1 entra em modo de manutenção
+    while(1){ // Mantém o processo gestao_config "vivo" para poder receber o sinal SIGUSR1
+    }
+   	
 }
 
 // Vê o tamanho do ficheiro a ser mapeado para a memória
 int get_stat(int fdin){
 	struct stat pstatbuf;	
-	if (fstat(fdin, &pstatbuf) < 0){	/* need size of input file */
+	if (fstat(fdin, &pstatbuf) < 0){
 		fprintf(stderr,"fstat error\n");
 		exit(1);
 	}
@@ -569,52 +741,110 @@ int get_stat(int fdin){
 
 // Enviar a resposta quando se trata de um pedido local
 void send_local(request* pedido){
-	printf("ENVIAR RESPOSTA LOCAL\n");
-	char localdomains[MAX_BUF], local_ip[MAX_BUF];
-	int i,k,j;
+	#ifdef DEBUG
+	printf("DEBUG: ENVIAR RESPOSTA LOCAL\n");
+	#endif
 
-	for(i = 0; i < strlen(src); i++){
+	char localdomains[MAX_BUF], local_ip[MAX_BUF];
+	int i, k, j, we_are_in_answer_section = 0;
+
+	sem_wait(mmf);
+	for(i = 0; i < strlen(local_domain_mmf); i++){
 		k = 0;
-		while(src[i] != ' '){
-			localdomains[k] = src[i];
+		while(local_domain_mmf[i] != ' '){
+			localdomains[k] = local_domain_mmf[i];
 			i++;
 			k++;
 		}
 		localdomains[k] = '\0';
+		
 		if (strcmp(localdomains, pedido->buffer) == 0){
 			j = 0;
-			while ((src[i] != '\n')){
-				if (src[i] != ' '){
-					local_ip[j] = src[i];
+			while ((local_domain_mmf[i] != '\n')){
+				if (local_domain_mmf[i] != ' '){
+					local_ip[j] = local_domain_mmf[i];
 					j++;
 				}
 				i++;
 			}
-			sendReply(pedido->query_id, pedido->buffer, inet_addr(local_ip), pedido->socket, pedido->dest); //Envia a resposta caso pertença ao localdns.txt!
+			we_are_in_answer_section = 1;
 			break;
 		}
 		else{
-			while (src[i] != '\n')
+			while (local_domain_mmf[i] != '\n')
 				i++;
 		} 
 	}
+	sem_post(mmf);
+
+	if (we_are_in_answer_section == 0)
+    	sendReply(pedido->query_id, pedido->buffer, inet_addr("0.0.0.0"), pedido->socket, pedido->dest,3); // 3 - code do dig para non existing domain
+    else
+    	sendReply(pedido->query_id, pedido->buffer, inet_addr(local_ip), pedido->socket, pedido->dest,0); // 0 - tudo normal
+}
+
+// Enviar resposta quando se trata de um pedido externo
+void send_extern(request* pedido){
+	int i = 0, j = 0;
+	#ifdef DEBUG
+	printf("DEBUG: ENVIAR RESPOSTA EXTERNA\n");
+	#endif
+
+
+    char buf[MAX_BUF], finds_ip[MAX_BUF];
+    char *str1 = "dig ";
+    int we_are_in_answer_section = 0;
+    FILE *fp;
+    // Constrói o comando dig para fazer o dig do pedido externo
+    char cmd[strlen(str1) + strlen(pedido->buffer) + 1];
+    strcpy(cmd, str1);
+    strcat(cmd, pedido->buffer);
+    // Executa o dig 
+    if ((fp = popen(cmd, "r")) == NULL){
+        printf("Error opening pipe!\n");
+        return;
+    }
+
+    while (fgets(buf, MAX_BUF, fp) != NULL){
+        if (we_are_in_answer_section == 1){
+    		while (buf[i] != 'A'){
+    			i++;
+    		}
+    		while(!isdigit(buf[i])){
+    			i++;
+    		}
+    		if (isdigit(buf[i])){
+				while(buf[i] != '\0'){
+					finds_ip[j] = buf[i]; 
+					j++;
+					i++;
+				}
+				finds_ip[j] = '\0';
+        	}
+        	break;
+        }
+        if(strstr(buf, "ANSWER SECTION") != NULL) {
+		    we_are_in_answer_section = 1;
+		}
+    }
+    if (we_are_in_answer_section == 0)
+    	sendReply(pedido->query_id, pedido->buffer, inet_addr("0.0.0.0"), pedido->socket, pedido->dest,3); // Se não obtiver resposta 
+    else
+    	sendReply(pedido->query_id, pedido->buffer, inet_addr(finds_ip), pedido->socket, pedido->dest,0); // Se obtiver resposta
+   	
+   	wait(NULL);
+    pclose(fp);
 }
 
 
-
 int main( int argc , char *argv[]){
-
 	set_hora(hora_arranque); // Determina a hora de arranque do Servidor
-	struct sockaddr_in client_name;
-	socklen_t client_name_len = sizeof(client_name);
-	int i, fd, fdin, j, k, recusa = 0;
-	char *ptr;
-	char req_buf[1024];
-	char buffer[MAX_BUF], line[MAX_BUF];
+	int i, j, k, recusa = 0;
+	char buffer[MAX_BUF];
 
 
 	// Verifica o número de argumentos
-	if(argc!=2) {
+	if(argc!=2){
 		printf("Usage: %s <port>\n", argv[0]);
 		exit(1);
 	}
@@ -623,45 +853,63 @@ int main( int argc , char *argv[]){
 	configuracoes = malloc(sizeof(mem_config));
 
 	// Cria e mapeia a região de memória partilhada das configurações
-	shmid = shmget(IPC_PRIVATE, sizeof(mem_config), IPC_CREAT|0700);
+	#ifdef DEBUG
+	printf("DEBUG: Criando memória partilhada...\n");
+	#endif
+
+	shmid = shmget(IPC_PRIVATE, sizeof(mem_config), IPC_CREAT|0700); //shmget cria o espaço de memória e devolve o id
 	if(shmid==-1){ 
 		perror("ERRO ao criar memória partilhada");
 		exit(1);
 	}
-    configuracoes = (mem_config*) shmat(shmid, NULL, 0); 
+    configuracoes = (mem_config*) shmat(shmid, NULL, 0); //mapeia o espaço de memória criado (id devolvido pelo shmget) e retorna o endereço da memória mapeada
     if(configuracoes == (mem_config*) -1){
     	perror("ERRO no shmat");
     	exit(1);
     }
     // Inicializa e abre o semáforo que controla o acesso à memória partilhada das configurações
-	sem_unlink("MEM");
-	mem = sem_open("MEM", O_CREAT|O_EXCL, 0700, 1);
+	sem_unlink("MEM"); //remove semáforo com o mesmo nome
+	mem = sem_open("MEM", O_CREAT|O_EXCL, 0700, 1); //Cria o semáforo.. O_CREAT - > Caso não existe cria  O_EXCL -> Assegura-se de que criou o semáforo 1 -> Estado inicial do semáforo
 	if(mem==SEM_FAILED){
 		perror("ERRO na criação do semáforo");
 		exit(1);
 	}
 
-	//Mapeiar o ficheiro localdns.txt para memória (Memory mapped files)
-	if ( (fdin = open("localdns.txt", O_RDONLY)) < 0)
-	{
+	// Mapear o ficheiro localdns.txt para memória (Memory mapped files)
+	#ifdef DEBUG
+	printf("DEBUG: Mapear o ficheiro localdns.txt para memória...\n");
+	#endif
+
+	// Abre o ficheiro localdns para leitura
+	if ( (fdin = open("localdns.txt", O_RDONLY)) < 0){ 
 		fprintf(stderr,"Can't open localdns.txt for reading");
 		exit(1);
 	}
+	// Tamanho do ficheiro que vamos mapear
 	size = get_stat(fdin);
 
-	if ( (src = mmap(0, size, PROT_READ, MAP_FILE | MAP_PRIVATE, fdin, 0)) == (caddr_t) -1)
-	{
-		fprintf(stderr,"mmap error for input\n");
+	// Mapeia o ficheiro
+	if ((local_domain_mmf = mmap(0, size, PROT_READ, MAP_FILE | MAP_PRIVATE, fdin, 0)) == (caddr_t) -1){ // mmap -> mapeia o ficheiro e retorna o endereço 
+		fprintf(stderr,"mmap error for input\n");													     // PROT_READ -> O ficheiro está protegido para leitura
+		exit(1);																						 // MAP_PRIVATE -> Creates private copy-on-write
+	}																									 // MAP_FILE -> Compatibility flag. Ignored.
+																									     // fdin -> Descritor do ficheiro 
+
+	// Inicializa e abre o semáforo que controla o acesso ao memory mapped file
+	sem_unlink("MMF");
+	mmf = sem_open("MMF", O_CREAT|O_EXCL, 0700, 1);
+	if(mmf==SEM_FAILED){
+		perror("ERRO na criação do semáforo");
 		exit(1);
 	}
-	
-	// Cria os processos filho
+
+	// Cria os processos gestor de configurações e gestor de estatisticas
 	for(i=0; i<2; i++){
 		if((processos[i] = fork()) == 0){
 			switch(i){
 				case 0:
+					printf("\nNumero do processo de Gestão de Gonfigurações: %ld\n\n",(long)getpid());
 					gestao_config();
-					exit(0);
 					break;
 				case 1:
 					gestao_estatisticas();
@@ -670,19 +918,26 @@ int main( int argc , char *argv[]){
 			}
 		}
 	}
-	sleep(3);
+	sleep(1); // Espera que os processos sejam criados
+	#ifdef DEBUG
+	printf("DEBUG: Criando pool...\n");
+	#endif
 	cria_pool(configuracoes->num_threads);
-	
+
+	#ifdef DEBUG
+	printf("DEBUG: Criando pipe para escrever...\n");
+	#endif
+
 	// Criar um named pipe
     mkfifo(configuracoes->named_pipe_estat, 0666);
     fd = open(configuracoes->named_pipe_estat, O_WRONLY);
 
+    signal(SIGINT, ctrl_c); // Tratamento do sinal SIGINT
 
-	//*******************************
-	//CODIGO DADO COMECA AQUI!!!!!
-	//*******************************
+
+
 	unsigned char buf[65536], *reader;
-	int sockfd, stop;
+	int stop;
 	struct DNS_HEADER *dns = NULL;
 	
 	struct sockaddr_in servaddr,dest;
@@ -734,7 +989,6 @@ int main( int argc , char *argv[]){
 		 }
 		 exit(1);
 	}
-	
 	// ****************************************
 	// Receive questions
 	// ****************************************
@@ -742,6 +996,7 @@ int main( int argc , char *argv[]){
 	while(1) {
 		// Receive questions
 		len = sizeof(dest);
+		recusa = 0;
 		printf("\n\n-- Waiting for DNS message --\n\n");
 		if(recvfrom (sockfd,(char*)buf , 65536 , 0 , (struct sockaddr*)&dest , &len) < 0) {
 			printf("Error while waiting for DNS message. Exiting...\n");
@@ -752,7 +1007,6 @@ int main( int argc , char *argv[]){
 		
 		// Process received message
 		dns = (struct DNS_HEADER*) buf;
-		//qname =(unsigned char*)&buf[sizeof(struct DNS_HEADER)];
 		reader = &buf[sizeof(struct DNS_HEADER)];
 	 
 		printf("\nThe query %d contains: ", ntohs(dns->id));
@@ -797,42 +1051,38 @@ int main( int argc , char *argv[]){
 		printf(">> Type (A): %d\n", ntohs(query.ques->qtype));
 		printf(">> Class (IN): %d\n\n", ntohs(query.ques->qclass));
 
-		//VERIFICAR SE É PARA RECUSAR PEDIDO OU NÃO
-		recusa = 0;
-		if (strstr(query.name, configuracoes->local_domain) != NULL){
-			printf("\nE LOCAL!\n");
-			sprintf(buffer,"local");
-	 		write(fd, buffer, sizeof(buffer));
-	 		adiciona_pedido(1, sockfd, query.name, dns->id, dest);
-	 		recusa = 1;
-			//adiciona pedido fila prioritaria
-		}
-		
-		else {
-			i = 0;
-			while (configuracoes->domains[i]!= '\0') {
 
-				if(strstr(query.name, configuracoes->domains[i]) != NULL) {
-					recusa = 1;
-					sprintf(buffer,"externo");
-					printf("\nE EXTERNO!\n");
-			 		write(fd, buffer, sizeof(buffer));
-			 		adiciona_pedido(2, sockfd, query.name, dns->id, dest);
-			 		break;
-			 		//adiciona pedido a fila secundaria
+		//Verifica se o pedido é aceite(adiciona-o) ou é recusado
+		if (strstr(query.name, configuracoes->local_domain) != NULL){ // Compara a query name com o local domain
+			sprintf(buffer,"local"); // Copia a string para o buffer
+	 		write(fd, buffer, sizeof(buffer)); // Escreve para o pipe do gestor de estatísticas
+	 		adiciona_pedido(1, sockfd, query.name, dns->id, dest); // Adiciona o pedido de tipo 1 (prioritário) e as variáveis para enviar a resposta
+	 		recusa = 1; // O pedido já não vai ser recusado
+			//Adiciona pedido fila prioritaria
+		}
+
+		if (!configuracoes->manutencao){ // Só entra aqui quando não está em manutenção. Em manutenção só tratamos os locais, os restantes são recusados
+			if(configuracoes->num_domain_extern != 0){ // Se existirem domínios externos
+				for(i=0; i<configuracoes->num_domain_extern;i++){ // Percorremos os domínios
+					if (strstr(query.name, configuracoes->domains[i]) != NULL){ // Vemos se o nome do domínio está no pedido
+						sprintf(buffer,"externo"); // Copia a string para o buffer
+		 				write(fd, buffer, sizeof(buffer)); // Escreve para o pipe do gestor de estatísticas
+		 				adiciona_pedido(2, sockfd, query.name, dns->id, dest); // Adiciona o pedido de tipo 2 (externo) e as variáveis para enviar a resposta
+		 				recusa = 1; // O pedido já não vai ser recusado
+		 				//Adiciona pedido a fila secundaria
+		 				break;
+					}
 				}
-				i++;
 			}
-
 		}
-		
-		
+		//O pedido é recusado
 		if (recusa == 0){
 			sprintf(buffer,"recusa");
-			printf("\nE PARA RECUSAR\n");
-			//recusa pedido
-			
+	 		write(fd, buffer, sizeof(buffer)); // Escreve para o pipe das estatísticas que foi recusado
+	 		printf("PEDIDO RECUSADO\n");
+			sendReply(dns->id, query.name, inet_addr("10.0.0.2"), sockfd, dest,5); // O 5 é o error code do dig para indicar que foi recusado
 		}
+		
 		// ****************************************
 		// Example reply to the received QUERY
 		// (Currently replying 10.0.0.2 to all QUERY names)
@@ -841,13 +1091,7 @@ int main( int argc , char *argv[]){
 		
 	}
 	
-	//fechar o pipe
-	close(fd);
-	munmap(src,size);
-	close(fdin);
-    /* remove the FIFO */
-    unlink(configuracoes->named_pipe_estat);
-    destroi_pool();
+	
 
     return 0;
 }
@@ -860,7 +1104,7 @@ int main( int argc , char *argv[]){
 	* sockfd: the socket to use for the reply
 	* dest: the UDP package structure with the information of the DNS query requestor (includes it's IP and port to send the reply)
 **/
-void sendReply(unsigned short id, unsigned char* query, int ip_addr, int sockfd, struct sockaddr_in dest) {
+void sendReply(unsigned short id, unsigned char* query, int ip_addr, int sockfd, struct sockaddr_in dest, int code) {
 		unsigned char bufReply[65536], *rname;
 		char *rip;
 		struct R_DATA *rinfo = NULL;
@@ -878,9 +1122,12 @@ void sendReply(unsigned short id, unsigned char* query, int ip_addr, int sockfd,
 		rdns->z = 0;
 		rdns->ad = 0;
 		rdns->cd = 0;
-		rdns->rcode = 0;
+		rdns->rcode = code;
 		rdns->q_count = 0;
-		rdns->ans_count = htons(1);
+		if (code == 5)
+			rdns->ans_count = 0;
+		else
+			rdns->ans_count = htons(1);
 		rdns->auth_count = 0;
 		rdns->add_count = 0;
 		

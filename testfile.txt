@@ -1,4 +1,0 @@
-Threads = 5
-Domains = uc.pt; edu; rita.pt; etc
-LocalDomain = so.local
-NamedPipeEstatisticas = statistics
